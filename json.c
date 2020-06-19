@@ -78,7 +78,7 @@ union JSON_UValue
 	char *u_string;
 	json_uvalue_t *u_array;
 	int u_int;
-	int u_boolean;
+	char u_boolean;
 	float u_float;
 	double u_double;
 	json_node_t *u_object;
@@ -88,22 +88,8 @@ struct JSON_Value
 {
 	int type;
 	char *name;
-	json_uvalue_t *value;
+	json_uvalue_t value;
 };
-
-/*
- * We will be using this for a pointer to json_value_t, which
- * contains our json_uvalue_t *. We need to dereference the
- * json_uvalue_t * and cast it to the relevant type.
- *
- * To allow it to dereference the json_uvalue_t * within the
- * json_value_t struct, we should cast its type to a T *:
- *
- * e.g.,	VALUE_CAST(value, json_node_t *) => ((json_node_t *)(*((json_value_t **)value->value)))
- *		VALUE_CAST(value, int) => ((int)(*((int *)value->value)))
- *		VALUE_CAST(value, char **) ((char **)(*((char ***)value->value)))
- */
-#define VALUE_CAST(v,t) ((t)(*((t*)v->value)))
 
 #define CR	'\r'
 #define NL	'\n'
@@ -290,9 +276,9 @@ parse_array(void)
 	int nr;
 	char _s[1024];
 
-	for (arr = calloc(1, sizeof(json_uvalue_t)), nr = 0;
+	for (arr = calloc(1, sizeof(json_value_t)), nr = 0;
 		;
-		arr = realloc(arr, (nr+1) * sizeof(json_uvalue_t)), ++nr) 
+		arr = realloc(arr, (nr+1) * sizeof(json_value_t)), ++nr) 
 	{
 		advance();
 
@@ -302,30 +288,25 @@ parse_array(void)
 
 		if (matches(TOK_DQUOTE))
 		{
-			VALUE_CAST(o, char *) = parse_string();
+			o->value.u_string = parse_string();
 			o->type = VALUE_STRING;
 		}
 		else
 		if (matches(TOK_MINUS))
 		{
-			int val = parse_number();
-			VALUE_CAST(o, int) = val * -1;
+			o->value.u_int = -1 * parse_number();
 			o->type = VALUE_NUMBER;
 		}
 		else
 		if (matches(TOK_DIGIT))
 		{
-			// ((int)(*((int *)o->value)))
-			VALUE_CAST(o, int) = parse_number();
+			o->value.u_int = parse_number();
 			o->type = VALUE_NUMBER;
 		}
 		else
 		if (matches(TOK_CHARSEQ))
 		{
-			char *s = parse_string();
-
-			// ((char *)(*((char **)o->value)))
-			VALUE_CAST(o, char *) = s;
+			o->value.u_string = parse_string_nodquotes();
 			o->type = string_type(s);
 		}
 		else
@@ -353,7 +334,7 @@ parse_array(void)
 	assert(arr);
 
 	o = &arr[nr];
-	VALUE_CAST(o, int) = ARRAY_END_SENTINEL; // 0xdeadbeef
+	o->value.u_int = ARRAY_END_SENTINEL;
 	o->name = NULL;
 
 	return arr;
@@ -438,6 +419,8 @@ JSON_new(void)
  * The value array is allocated as one chunk of memory on the heap.
  * So only one free is needed unlike the array of values that are
  * within JSON nodes (json_value_t **).
+ *
+ * The only value types that need freed are VALUE_STRING.
  */
 static void
 do_free_value_array(json_value_t *arr)
@@ -448,16 +431,11 @@ do_free_value_array(json_value_t *arr)
 
 	for (i = 0; VALUE_CAST(&arr[i], int) != 0xdeadbeef; ++i)
 	{
-	/*
-	 * The only value types that need freed are null, boolean and string.
-	 */
 		switch(arr[i].type)
 		{
-			case VALUE_NULL:
-			case VALUE_BOOLEAN:
 			case VALUE_STRING:
 
-				free(VALUE_CAST(&arr[i], char *));
+				free(arr[i].value.u_string);
 				break;
 
 			default:
@@ -505,23 +483,17 @@ do_free(json_node_t *root)
 		{
 			case VALUE_OBJECT:
 
-				do_free(VALUE_CAST(v, json_node_t *));
+				do_free(v->value.u_object);
 				break;
 
-		/*
-		 * null and boolean types are strings ("null", "true", "false")
-		 * which live on the heap and need to be freed.
-		 */
-			case VALUE_NULL:
-			case VALUE_BOOLEAN:
 			case VALUE_STRING:
 
-				free(VALUE_CAST(v, char *));
+				free(v->value.u_string);
 				break;
 
 			case VALUE_ARRAY:
 
-				do_free_value_array(VALUE_CAST(v, json_value_t *));
+				do_free_value_array(v->value.u_array));
 				break;
 
 			default:
@@ -550,7 +522,7 @@ JSON_free(json_t *json)
 }
 
 #define STACK_MAX_SIZE 256
-// keep track of the current parent node of newly created nodes
+// keep track of the current parent node of newly values
 static json_node_t *stack[STACK_MAX_SIZE];
 static int stack_idx = 0;
 
@@ -572,6 +544,12 @@ static json_node_t *node = NULL;
 static json_node_t *parent = NULL;
 static json_value_t *value = NULL;
 
+/*
+ * Always 0 or 1. So when we encounter a DQUOTE
+ * and need to parse a string we know whether
+ * this is going to be the key or the value.
+ * (0 for key, 1 for value).
+ */
 #define TOGGLE_STATE() (state = (state + 1) & 1)
 #define GETTING_VALUE() (state == 1)
 static int state = 0;
@@ -579,12 +557,15 @@ static int state = 0;
 json_t *
 JSON_parse(char *json_data)
 {
+	char *__str = NULL;
+
 	assert(json_data);
 	ptr = json_data;
 
 	json_t *jn = JSON_new();
 	jn->root = new_node();
 
+	assert(jn);
 	assert(jn->root);
 
 	jn->root->name = strdup("root");
@@ -592,6 +573,9 @@ JSON_parse(char *json_data)
 
 	CLEAR_STACK();
 
+/*
+ * First lex'd character should always be an opening '{'
+ */
 	advance();
 	assert(matches(TOK_LBRACE));
 
@@ -618,7 +602,7 @@ JSON_parse(char *json_data)
 				if (minus)
 					v *= -1;
 
-				VALUE_CAST(value, int) = v;
+				value->value.u_int = v;
 				value->type = VALUE_NUMBER;
 
 				add_value(parent, value);
@@ -638,7 +622,7 @@ JSON_parse(char *json_data)
 
 				if (GETTING_VALUE())
 				{
-					VALUE_CAST(value, char *) = parse_string();
+					value->value.u_string = parse_string();
 					value->type = VALUE_STRING;
 
 					Debug("Got value %s\n", VALUE_CAST(value, char *));
@@ -662,7 +646,7 @@ JSON_parse(char *json_data)
 				node = new_node();
 				assert(node);
 
-				VALUE_CAST(value, json_node_t *) = node;
+				value->value.u_object = node;
 				value->type = VALUE_OBJECT;
 
 				add_value(parent, value);
@@ -684,10 +668,9 @@ JSON_parse(char *json_data)
 			case TOK_LBRACK:
 
 				Debug("Parsing JSON array\n");
-				value->type = VALUE_ARRAY;
 
-				// ((json_value_t *)(*((json_value_t **)value->value)))
-				VALUE_CAST(value, json_value_t *) = parse_array();
+				value->value.u_array = parse_array();
+				value->type = VALUE_ARRAY;
 
 				add_value(parent, value);
 
@@ -698,8 +681,26 @@ JSON_parse(char *json_data)
 		 * If we are about to parse a value and we didn't find a DQUOTE,
 		 * then it must be null, or true/false.
 		 */
-				VALUE_CAST(value, char *) = parse_string_nodquotes();
-				value->type = string_type(VALUE_CAST(value, char *));
+				__str = parse_string_nodquotes();
+				if (!strcmp(__str, "true"))
+				{
+					value->value.u_boolean = TRUE;
+					value->type = VALUE_BOOLEAN;
+				}
+				else
+				if (!strcmp(__str, "false"))
+				{
+					value->value.u_boolean = FALSE;
+					value->type = VALUE_BOOLEAN;
+				}
+				else
+				if (!strcmp(__str, "null"))
+				{
+					value->value.u_string = NULL;
+					value->type = VALUE_NULL;
+				}
+				
+				free(__str);
 
 			default:
 				break;
